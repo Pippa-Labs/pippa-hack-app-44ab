@@ -45,65 +45,82 @@ app:
   # Must be `hack.` + this repository's name with `pippa-hack-` removed and
   # every hyphen turned into an underscore.
   id: hack.app_44ab
-  name: UK Tide Times
+  name: London Side Quests
   # Three numbers. Bump it before pushing again once a version is submitted.
-  version: 0.1.0
+  version: 0.2.0
   # Never use the word "by" here: the badge is split on the first "by".
   summary: >-
-    Finds the next high tide at a UK beach or seaside town, with its time and
-    height, and says whether the tide is coming in right now. Sends only the
-    place name to a geocoder and its coordinates to the Open-Meteo marine
-    forecast.
+    Turns a London location into a quest board of nearby cafés, hidden spots,
+    landmarks, museums and live events within about a kilometre, each with a
+    rarity tier, XP and walking distance. Sends the place name to
+    OpenStreetMap, its coordinates to OpenStreetMap and Ticketmaster, and
+    landmark titles to Wikipedia.
 
 agent_types:
   - personal
 
 outcomes:
-  - id: tide.next_high
-    summary: When the next high tide is at a named UK beach, and whether the tide is coming in
+  - id: quests.board
+    summary: A quest board of things to explore near a London location, with XP, rarity and a quest chain
     example_phrases:
-      - when is the next high tide
-      - what time is high tide at
-      - when's high tide
-      - next high tide at the beach
-      - high tide times for
-      - when does the tide come in at
-      - is the tide coming in
-      - when is high water at
+      - give me side quests near
+      - side quests around
+      - quest board for
+      - things to explore near
+      - what's interesting to do around
+      - i have an hour to kill near
+      - fun places nearby in london
+      - adventure ideas around
     inputs:
       - name: place
         type: string
         required: false
         description: >-
-          The UK beach, bay, harbour or seaside town the user is asking about,
-          as they wrote it, for example "Brighton", "Camber Sands" or
-          "St Ives, Cornwall". If the message does not name a place, return an
+          The London place, street, station, landmark or postcode the user wants
+          quests around, as they wrote it, for example "Shoreditch", "King's
+          Cross" or "SE1 9DT". If the message does not name a place, return an
           empty string rather than guessing.
+      - name: minutes_available
+        type: integer
+        required: false
+        description: >-
+          How many minutes the user says they have, converted to minutes ("an
+          hour" is 60, "a couple of hours" is 120). Leave this out entirely if
+          they did not say how long they have. Never guess.
     output:
       - name: place_used
         type: string
-        description: The place the tide was worked out for, as the geocoder named it.
-      - name: high_tide_time
-        type: datetime
-        description: When the next high tide is, in UK time with its offset.
-      - name: high_tide_clock
-        type: string
-        description: The same moment written for a person, e.g. "Fri 20 Nov, 17:42".
-      - name: minutes_until
-        type: integer
-        description: Whole minutes from now until that high tide.
-      - name: height_m
-        type: number
+        description: The place the quests were found around, as OpenStreetMap named it.
+      - name: quests
+        type: array
+        item_type: string
         description: >-
-          Predicted water level at that high tide in metres above mean sea
-          level (not chart datum, so it is lower than the figure in tide tables).
-      - name: tide_rising
-        type: boolean
-        description: True if the tide is coming in right now, false if it is going out.
-      - name: following_high_time
-        type: datetime
+          Four to six quest lines, each with its rarity tier, name, distance,
+          XP and a one-line description; Legendary quests carry a lore fact and
+          Limited-time quests say when they end.
+      - name: quest_count
+        type: integer
+        description: How many quests are on the board.
+      - name: total_xp
+        type: integer
+        description: XP for completing every quest on the board, not counting the chain.
+      - name: quest_chain
+        type: array
+        item_type: string
         required: false
-        description: The high tide after that one, if the forecast reaches it.
+        description: Three nearby places to visit in order, as one chain, with the walk between each.
+      - name: chain_bonus_xp
+        type: integer
+        required: false
+        description: Extra XP for finishing the whole chain.
+      - name: events_included
+        type: boolean
+        description: False when live events could not be loaded, so no Limited-time quests appear.
+
+app_secrets:
+  - name: TICKETMASTER_KEY
+    description: "Ticketmaster Discovery API key, used to find live events near the location"
+    required: false
 
 # ── API keys your app needs (this example needs none) ────────────────────────
 #
