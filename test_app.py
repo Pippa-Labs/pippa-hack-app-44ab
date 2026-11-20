@@ -24,6 +24,7 @@ from app import App, NoPlaceGiven, NothingNearby, PlaceNotFound, _first_sentence
 # 14:00 on Friday 20 November 2026 (GMT, so UK time is the same as UTC).
 NOW = datetime(2026, 11, 20, 14, 0, tzinfo=timezone.utc)
 FAKE_KEY = "test-not-a-real-key-123"  # pragma: allowlist secret
+FAKE_SKIDDLE_KEY = "test-not-a-real-skiddle-456"  # pragma: allowlist secret
 
 # Around Tower Hill. Roughly 111 m per 0.001 deg of latitude.
 ORIGIN = {"lat": "51.5100", "lon": "-0.0760", "name": "Tower Hill"}
@@ -64,12 +65,34 @@ TICKETMASTER = {
     ]}
 }
 
+# Skiddle does not document its reply; this is the shape its API returns.
+SKIDDLE = {
+    "error": 0,
+    "totalcount": "3",
+    "results": [
+        {"id": "1", "eventname": "Basement Disco Night",
+         "venue": {"name": "The Crypt Club", "latitude": 51.5112,
+                   "longitude": -0.0772},
+         "date": "2026-11-20",
+         "startdate": "2026-11-20T22:00:00+00:00",
+         "enddate": "2026-11-21T03:00:00+00:00", "cancelled": "0"},
+        {"id": "2", "eventname": "The Ghost Walk of the City!",  # also on Ticketmaster
+         "venue": {"name": "Tower Hill Steps", "latitude": 51.5098,
+                   "longitude": -0.0765},
+         "date": "2026-11-21",
+         "startdate": "2026-11-21T19:00:00+00:00", "cancelled": "0"},
+        {"id": "3", "eventname": "Called-Off Comedy",
+         "venue": {"name": "Somewhere"}, "date": "2026-11-22",
+         "cancelled": "1"},
+    ],
+}
+
 WIKI = {"extract": "The Tower of London is a historic castle on the north bank "
                    "of the River Thames. It was founded in 1066."}
 
 
 def make_fetch(geocode=None, overpass=None, events=None, wiki=None, log=None,
-               fail_events=None):
+               fail_events=None, skiddle=None, fail_skiddle=None):
     def fetch(url, timeout=6.0):
         if log is not None:
             log.append(url)
@@ -82,6 +105,10 @@ def make_fetch(geocode=None, overpass=None, events=None, wiki=None, log=None,
             if fail_events is not None:
                 raise fail_events
             return json.dumps(TICKETMASTER if events is None else events).encode()
+        if "www.skiddle.com" in url:
+            if fail_skiddle is not None:
+                raise fail_skiddle
+            return json.dumps(SKIDDLE if skiddle is None else skiddle).encode()
         if "en.wikipedia.org" in url:
             return json.dumps(WIKI if wiki is None else wiki).encode()
         raise AssertionError("unexpected request")
@@ -100,12 +127,28 @@ def call(inputs, fetch=None, *, explicit=False):
 
 @pytest.fixture
 def key(monkeypatch):
+    """Ticketmaster only."""
     monkeypatch.setenv("TICKETMASTER_KEY", FAKE_KEY)
+    monkeypatch.delenv("SKIDDLE_KEY", raising=False)
+
+
+@pytest.fixture
+def skiddle_key(monkeypatch):
+    """Skiddle only."""
+    monkeypatch.delenv("TICKETMASTER_KEY", raising=False)
+    monkeypatch.setenv("SKIDDLE_KEY", FAKE_SKIDDLE_KEY)
+
+
+@pytest.fixture
+def both_keys(monkeypatch):
+    monkeypatch.setenv("TICKETMASTER_KEY", FAKE_KEY)
+    monkeypatch.setenv("SKIDDLE_KEY", FAKE_SKIDDLE_KEY)
 
 
 @pytest.fixture
 def no_key(monkeypatch):
     monkeypatch.delenv("TICKETMASTER_KEY", raising=False)
+    monkeypatch.delenv("SKIDDLE_KEY", raising=False)
 
 
 def test_the_manifest_is_valid():
@@ -193,7 +236,71 @@ def test_without_a_key_events_are_skipped_and_never_requested(no_key):
     log = []
     result = call({"place": "Tower Hill"}, make_fetch(log=log))
     assert result.data["events_included"] is False
-    assert not any("ticketmaster" in u for u in log)
+    assert not any("ticketmaster" in u or "skiddle" in u for u in log)
+    assert any("No events key" in w for w in result.warnings)
+
+
+def test_skiddle_events_become_limited_time_quests(skiddle_key):
+    result = call({"place": "Tower Hill"})
+    assert result.data["events_included"] is True
+    events = [q for q in result.data["quests"] if q.startswith("⚡")]
+    assert events
+    disco = next(q for q in events if "Basement Disco Night" in q)
+    assert "At The Crypt Club" in disco and "ends Sat 21 Nov, 03:00" in disco
+    assert not any("Called-Off Comedy" in q for q in result.data["quests"])
+
+
+def test_skiddle_is_asked_for_the_right_area_and_week(skiddle_key):
+    log = []
+    call({"place": "Tower Hill"}, make_fetch(log=log))
+    url = next(u for u in log if "skiddle" in u)
+    for part in ("latitude=51.51000", "longitude=-0.07600", "radius=1",
+                 "minDate=2026-11-20", "maxDate=2026-11-27", "country=GB"):
+        assert part in url
+
+
+def test_an_event_on_both_services_appears_once(both_keys):
+    from app import App as _App
+    app = _App()
+    app._fetch = make_fetch()
+    events = app._ticketmaster_events(51.51, -0.076, NOW, FAKE_KEY) + \
+        app._skiddle_events(51.51, -0.076, NOW, FAKE_SKIDDLE_KEY)
+    from app import _merge_events
+    names = [e.name for e in _merge_events(events)]
+    assert len([n for n in names if "Ghost Walk" in n]) == 1
+    assert names[0] == "Basement Disco Night"  # soonest first
+
+
+def test_one_events_service_failing_keeps_the_other(both_keys):
+    result = call({"place": "Tower Hill"}, make_fetch(fail_events=TimeoutError()))
+    assert result.data["events_included"] is True
+    assert any("Basement Disco Night" in q for q in result.data["quests"])
+    assert any("Events from Ticketmaster could not be loaded" in w
+               for w in result.warnings)
+
+
+def test_both_events_services_failing_still_returns_the_board(both_keys):
+    result = call({"place": "Tower Hill"}, make_fetch(
+        fail_events=TimeoutError(), fail_skiddle=TimeoutError()))
+    assert result.data["events_included"] is False
+    assert result.data["quest_count"] >= 4
+    assert any("Live events could not be loaded" in w for w in result.warnings)
+
+
+def test_a_skiddle_error_reply_is_a_failure_not_an_empty_list(skiddle_key):
+    """A bad key comes back as 200 with an error flag, not as an HTTP error."""
+    bad = {"error": 1, "errormessage": f"Invalid api_key {FAKE_SKIDDLE_KEY}"}
+    result = call({"place": "Tower Hill"}, make_fetch(skiddle=bad))
+    assert result.data["events_included"] is False
+    everything = json.dumps(result.data) + " ".join(result.warnings or ())
+    assert FAKE_SKIDDLE_KEY not in everything
+
+
+def test_the_skiddle_key_goes_only_to_skiddle(both_keys):
+    log = []
+    call({"place": "Tower Hill"}, make_fetch(log=log))
+    with_key = [u for u in log if FAKE_SKIDDLE_KEY in u]
+    assert with_key and all(u.startswith("https://www.skiddle.com/") for u in with_key)
 
 
 def test_the_key_never_appears_in_what_is_returned(key):

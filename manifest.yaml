@@ -53,8 +53,8 @@ app:
     Turns a London location into a quest board of nearby cafés, hidden spots,
     landmarks, museums and live events within about a kilometre, each with a
     rarity tier, XP and walking distance. Sends the place name to
-    OpenStreetMap, its coordinates to OpenStreetMap and Ticketmaster, and
-    landmark titles to Wikipedia.
+    OpenStreetMap, its coordinates to OpenStreetMap, Ticketmaster and Skiddle,
+    and landmark titles to Wikipedia.
 
 agent_types:
   - personal
@@ -120,6 +120,9 @@ outcomes:
 app_secrets:
   - name: TICKETMASTER_KEY
     description: "Ticketmaster Discovery API key, used to find live events near the location"
+    required: false
+  - name: SKIDDLE_KEY
+    description: "Skiddle API key, used to find club nights, gigs and comedy near the location"
     required: false
 
 # ── API keys your app needs (this example needs none) ────────────────────────

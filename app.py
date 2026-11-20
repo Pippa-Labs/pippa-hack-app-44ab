@@ -6,9 +6,12 @@ One call, four sources, no state:
 2. In parallel:
    - the OpenStreetMap Overpass API lists named cafés, restaurants,
      attractions, viewpoints, historic sites and museums within ~1 km;
-   - the Ticketmaster Discovery API lists events nearby in the next 7 days
-     (only if TICKETMASTER_KEY is set; if it fails, the board still comes back
-     without Limited-time quests).
+   - the Ticketmaster Discovery API and the Skiddle API list events nearby in
+     the next 7 days (each only if its key is set: TICKETMASTER_KEY,
+     SKIDDLE_KEY). Ticketmaster is strongest on big concerts and shows,
+     Skiddle on club nights, gigs, comedy and festivals. Events listed on
+     both appear once. If one fails, the other still counts; if both fail,
+     the board still comes back without Limited-time quests.
 3. Wikipedia gives a one-line lore fact for the Legendary quests.
 
 Rarity tiers:
@@ -55,6 +58,7 @@ USER_AGENT = "pippa-agent-app-london-side-quests/0.2 (https://github.com/Pippa-L
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 OVERPASS = "https://overpass-api.de/api/interpreter"
 TICKETMASTER_EVENTS = "https://app.ticketmaster.com/discovery/v2/events.json"
+SKIDDLE_EVENTS = "https://www.skiddle.com/api/v1/events/search/"
 WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 
 #: Greater London, as Nominatim's viewbox: west, north, east, south.
@@ -67,7 +71,7 @@ EVENT_RADIUS_KM = 2
 WALK_M_PER_MIN = 80
 
 #: Timeouts, sharing one 20 second budget: geocode, then Overpass and
-#: Ticketmaster side by side, then Wikipedia lookups side by side.
+#: the two event services side by side, then Wikipedia lookups side by side.
 GEOCODE_TIMEOUT = 5.0
 OVERPASS_TIMEOUT = 9.0
 EVENTS_TIMEOUT = 6.0
@@ -118,7 +122,7 @@ class NothingNearby(AgentAppError):
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse redirects, so the Ticketmaster key never follows one anywhere."""
+    """Refuse redirects, so an events key never follows one anywhere."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -138,6 +142,7 @@ class Spot:
     wikipedia: str = ""
     lore: str = ""
     when: str = ""  # events only: when it ends
+    start: datetime | None = None  # events only, for sorting soonest first
     extra: dict = field(default_factory=dict)
 
     @property
@@ -165,7 +170,7 @@ class App:
         """Fetch and parse, turning failures into the SDK's own errors.
 
         Never puts the URL or the response body in a message: the Ticketmaster
-        URL carries the key.
+        and Skiddle URLs carry their keys.
         """
         try:
             raw = self._fetch(url, timeout=timeout)
@@ -200,25 +205,37 @@ class App:
         radius = _radius_for(minutes)
 
         warnings: list[str] = []
-        events: list[Spot] = []
-        events_ok = False
-        key = os.environ.get("TICKETMASTER_KEY", "").strip()
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        sources = {
+            "Ticketmaster": (self._ticketmaster_events, os.environ.get("TICKETMASTER_KEY", "").strip()),
+            "Skiddle": (self._skiddle_events, os.environ.get("SKIDDLE_KEY", "").strip()),
+        }
+        with ThreadPoolExecutor(max_workers=3) as pool:
             places_job = pool.submit(self._places, lat, lon, radius)
-            events_job = pool.submit(self._events, lat, lon, now, key) if key else None
-            if events_job is not None:
+            event_jobs = {
+                label: pool.submit(fetch, lat, lon, now, key)
+                for label, (fetch, key) in sources.items() if key
+            }
+            found: list[Spot] = []
+            failed: list[str] = []
+            for label, job in event_jobs.items():
                 try:
-                    events = events_job.result()
-                    events_ok = True
+                    found += job.result()
                 except Exception:  # noqa: BLE001 — events are optional by design
-                    warnings.append(
-                        "Live events could not be loaded, so there are no "
-                        "Limited-time quests this time.")
-            else:
-                warnings.append(
-                    "No Ticketmaster key is set up yet, so there are no "
-                    "Limited-time quests.")
+                    failed.append(label)
             spots = places_job.result()
+
+        events_ok = len(failed) < len(event_jobs)
+        events = _merge_events(found)
+        if not event_jobs:
+            warnings.append(
+                "No events key is set up yet, so there are no Limited-time quests.")
+        elif not events_ok:
+            warnings.append(
+                "Live events could not be loaded, so there are no "
+                "Limited-time quests this time.")
+        else:
+            for label in failed:
+                warnings.append(f"Events from {label} could not be loaded this time.")
 
         if minutes is not None:
             spots = [s for s in spots if _fits(s, minutes)]
@@ -298,7 +315,7 @@ class App:
 
     # ── Step 2b: events from Ticketmaster ────────────────────────────────────
 
-    def _events(self, lat: float, lon: float, now: datetime, key: str) -> list[Spot]:
+    def _ticketmaster_events(self, lat: float, lon: float, now: datetime, key: str) -> list[Spot]:
         fmt = "%Y-%m-%dT%H:%M:%SZ"
         url = TICKETMASTER_EVENTS + "?" + urlencode({
             "apikey": key,
@@ -320,6 +337,36 @@ class App:
                 continue
             seen.add(spot.name.lower())
             events.append(spot)
+        return events
+
+    # ── Step 2c: events from Skiddle ─────────────────────────────────────────
+
+    def _skiddle_events(self, lat: float, lon: float, now: datetime, key: str) -> list[Spot]:
+        today = now.astimezone(UK_TIME).date()
+        url = SKIDDLE_EVENTS + "?" + urlencode({
+            "api_key": key,
+            "latitude": f"{lat:.5f}",
+            "longitude": f"{lon:.5f}",
+            "radius": max(1, round(EVENT_RADIUS_KM / 1.609)),  # Skiddle uses miles
+            "country": "GB",
+            "minDate": today.isoformat(),
+            "maxDate": (today + timedelta(days=7)).isoformat(),
+            "order": "distance",
+            "getdistance": 1,
+            "limit": 30,
+        })
+        data = self._get_json(url, "Skiddle", EVENTS_TIMEOUT)
+        if not isinstance(data, dict):
+            raise ServiceUnavailableError("Skiddle sent an unexpected reply")
+        if str(data.get("error", "0")) not in ("0", "", "False", "false"):
+            # A bad key arrives as a 200 with an error flag. Its message is
+            # never passed on: providers sometimes echo the request in it.
+            raise ServiceUnavailableError("Skiddle reported an error")
+        events: list[Spot] = []
+        for item in data.get("results") or []:
+            spot = _spot_from_skiddle(item, lat, lon, now)
+            if spot is not None:
+                events.append(spot)
         return events
 
     # ── Step 3: lore from Wikipedia ──────────────────────────────────────────
@@ -433,8 +480,70 @@ def _spot_from_event(item: dict, lat0: float, lon0: float, now: datetime) -> Spo
         when = f"on {local_date}" if local_date else "date to be confirmed"
 
     return Spot(name=name, kind="event", rarity=LIMITED, distance_m=distance,
-                lat=lat, lon=lon, when=when,
+                lat=lat, lon=lon, when=when, start=start,
                 extra={"venue": venue.get("name", "")})
+
+
+def _spot_from_skiddle(item: dict, lat0: float, lon0: float, now: datetime) -> Spot | None:
+    """One Skiddle event. Read cautiously: Skiddle does not document its reply."""
+    if not isinstance(item, dict):
+        return None
+    name = (item.get("eventname") or item.get("name") or "").strip()
+    if not name or str(item.get("cancelled", "0")) in ("1", "true", "True"):
+        return None
+
+    venue = item.get("venue") if isinstance(item.get("venue"), dict) else {}
+    try:
+        lat, lon = float(venue["latitude"]), float(venue["longitude"])
+        distance = _distance_m(lat0, lon0, lat, lon)
+    except (KeyError, TypeError, ValueError):
+        lat = lon = None
+        distance = 0
+
+    start = _parse_utc(item.get("startdate"))
+    end = _parse_utc(item.get("enddate"))
+    if end is not None and end < now:
+        return None
+    if end is not None:
+        when = f"ends {_clock(end)}"
+    elif start is not None:
+        when = f"starts {_clock(start)}, one showing only"
+    elif item.get("date"):
+        when = f"on {item['date']}"
+    else:
+        when = "date to be confirmed"
+
+    return Spot(name=name, kind="event", rarity=LIMITED, distance_m=distance,
+                lat=lat, lon=lon, when=when, start=start,
+                extra={"venue": venue.get("name", "")})
+
+
+def _merge_events(events: list[Spot]) -> list[Spot]:
+    """Both services, one list: soonest first, each event once.
+
+    The same show is often on both. Treat two events as one when their names
+    match once case, punctuation and "the" are ignored, and they start within
+    an hour of each other (or either has no start time).
+    """
+    far = datetime.max.replace(tzinfo=timezone.utc)
+    ordered = sorted(events, key=lambda e: (e.start or far, e.distance_m))
+    kept: list[Spot] = []
+    for event in ordered:
+        key = _name_key(event.name)
+        duplicate = any(
+            _name_key(other.name) == key and (
+                event.start is None or other.start is None
+                or abs((event.start - other.start).total_seconds()) <= 3600)
+            for other in kept
+        )
+        if not duplicate:
+            kept.append(event)
+    return kept
+
+
+def _name_key(name: str) -> str:
+    words = re.findall(r"[a-z0-9]+", name.lower())
+    return " ".join(w for w in words if w != "the")
 
 
 def _parse_utc(text: str | None) -> datetime | None:
