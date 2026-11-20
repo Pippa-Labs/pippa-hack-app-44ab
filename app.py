@@ -14,6 +14,9 @@ One call, four sources, no state:
      the board still comes back without Limited-time quests.
 3. Wikipedia gives a one-line lore fact for the Legendary quests.
 
+Places OpenStreetMap says are closed right now are left out, and so are
+memorial benches and the like, which are tagged "historic" but are not quests.
+
 Rarity tiers:
     Common      cafés and restaurants
     Rare        lesser-known spots: viewpoints, attractions and historic
@@ -29,6 +32,7 @@ import json
 import math
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 import zlib
@@ -56,7 +60,12 @@ MANIFEST_PATH = Path(__file__).with_name("manifest.yaml")
 USER_AGENT = "pippa-agent-app-london-side-quests/0.2 (https://github.com/Pippa-Labs)"
 
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
-OVERPASS = "https://overpass-api.de/api/interpreter"
+#: Public Overpass servers, tried in order. The main one is often busy at
+#: peak times; private.coffee is a public mirror with the same data.
+OVERPASS_SERVERS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
 TICKETMASTER_EVENTS = "https://app.ticketmaster.com/discovery/v2/events.json"
 SKIDDLE_EVENTS = "https://www.skiddle.com/api/v1/events/search/"
 WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
@@ -67,13 +76,20 @@ LONDON_VIEWBOX = "-0.5104,51.6919,0.3340,51.2868"
 UK_TIME = ZoneInfo("Europe/London")
 
 SEARCH_RADIUS_M = 1000
+#: Cafés and restaurants are searched closer in. Central London has hundreds
+#: within a kilometre, and Overpass cuts a long list in database order, not by
+#: distance, so a wide search would drop the café next door.
+FOOD_RADIUS_M = 450
 EVENT_RADIUS_KM = 2
 WALK_M_PER_MIN = 80
 
 #: Timeouts, sharing one 20 second budget: geocode, then Overpass and
 #: the two event services side by side, then Wikipedia lookups side by side.
 GEOCODE_TIMEOUT = 5.0
-OVERPASS_TIMEOUT = 9.0
+OVERPASS_TIMEOUT = 7.0
+#: Everything is planned to finish within this many seconds of the call
+#: starting, leaving room under Pippa's 20 second limit.
+BUDGET_SECONDS = 17.0
 EVENTS_TIMEOUT = 6.0
 LORE_TIMEOUT = 3.0
 
@@ -84,6 +100,11 @@ BADGE = {COMMON: "⚪ Common", RARE: "🔷 Rare", LEGENDARY: "🌟 Legendary",
 BASE_XP = {COMMON: 50, RARE: 120, LEGENDARY: 250, LIMITED: 200}
 #: Minutes spent at a place, for fitting quests into the time available.
 DWELL_MIN = {COMMON: 25, RARE: 15, LEGENDARY: 45}
+
+#: Tagged "historic" in OpenStreetMap, but not somewhere to send anybody on a
+#: quest: named benches, memorial trees, single graves and ghost bikes.
+#: Statues, plaques, monuments and war memorials stay in.
+NOT_QUESTS = frozenset({"bench", "tree", "grave", "ghost_bike", "tomb"})
 
 FLAVOUR = {
     "cafe": ["Refuel your mana with a brew at {n}.",
@@ -136,18 +157,20 @@ class Spot:
     name: str
     kind: str  # cafe, restaurant, viewpoint, museum, historic, attraction, event
     rarity: str
-    distance_m: int
+    distance_m: int | None  # None when an event's venue has no location
     lat: float | None = None
     lon: float | None = None
     wikipedia: str = ""
     lore: str = ""
     when: str = ""  # events only: when it ends
     start: datetime | None = None  # events only, for sorting soonest first
+    end: datetime | None = None  # events only
     extra: dict = field(default_factory=dict)
 
     @property
     def xp(self) -> int:
-        bonus = 5 * round(self.distance_m / 50)  # a little more for walking further
+        # A little more for walking further.
+        bonus = 0 if self.distance_m is None else 5 * round(self.distance_m / 50)
         return BASE_XP[self.rarity] + bonus
 
 
@@ -200,6 +223,9 @@ class App:
         if minutes is not None and minutes <= 0:
             minutes = None
         now = call.context.now.astimezone(timezone.utc)
+        # A stopwatch, not the date: the wall-clock time always comes from
+        # call.context.now.
+        deadline = time.monotonic() + BUDGET_SECONDS
 
         name, lat, lon = self._geocode(place)
         radius = _radius_for(minutes)
@@ -210,7 +236,7 @@ class App:
             "Skiddle": (self._skiddle_events, os.environ.get("SKIDDLE_KEY", "").strip()),
         }
         with ThreadPoolExecutor(max_workers=3) as pool:
-            places_job = pool.submit(self._places, lat, lon, radius)
+            places_job = pool.submit(self._places, lat, lon, radius, deadline)
             event_jobs = {
                 label: pool.submit(fetch, lat, lon, now, key)
                 for label, (fetch, key) in sources.items() if key
@@ -237,8 +263,12 @@ class App:
             for label in failed:
                 warnings.append(f"Events from {label} could not be loaded this time.")
 
+        local_now = now.astimezone(UK_TIME)
+        spots = [s for s in spots
+                 if _open_now(s.extra.get("opening_hours"), local_now) is not False]
         if minutes is not None:
             spots = [s for s in spots if _fits(s, minutes)]
+            events = _events_in_window_first(events, now, minutes)
 
         board = _pick_board(spots, events)
         if not board:
@@ -250,7 +280,7 @@ class App:
             raise error
 
         chain = _pick_chain(spots, board)
-        self._add_lore([s for s in board + chain if s.rarity == LEGENDARY][:4])
+        self._add_lore([s for s in board + chain if s.rarity == LEGENDARY][:4], deadline)
 
         data = {
             "place_used": name,
@@ -290,18 +320,19 @@ class App:
 
     # ── Step 2a: places from OpenStreetMap ───────────────────────────────────
 
-    def _places(self, lat: float, lon: float, radius: int) -> list[Spot]:
+    def _places(self, lat: float, lon: float, radius: int,
+                deadline: float | None = None) -> list[Spot]:
         around = f"(around:{radius},{lat:.6f},{lon:.6f})"
+        food = f"(around:{min(radius, FOOD_RADIUS_M)},{lat:.6f},{lon:.6f})"
         query = (
             "[out:json][timeout:8];"
-            f'(nwr{around}["amenity"~"^(cafe|restaurant)$"]["name"];)->.food;'
+            f'(nwr{food}["amenity"~"^(cafe|restaurant)$"]["name"];)->.food;'
             f'(nwr{around}["tourism"~"^(attraction|viewpoint|museum)$"]["name"];'
             f'nwr{around}["historic"]["name"];)->.sights;'
             ".food out center tags 80;"
             ".sights out center tags 150;"
         )
-        url = OVERPASS + "?" + urlencode({"data": query})
-        data = self._get_json(url, "the Overpass API", OVERPASS_TIMEOUT)
+        data = self._overpass(query, deadline)
         spots: list[Spot] = []
         seen: set[str] = set()
         for element in (data or {}).get("elements", []):
@@ -312,6 +343,27 @@ class App:
             spots.append(spot)
         spots.sort(key=lambda s: s.distance_m)
         return spots
+
+    def _overpass(self, query: str, deadline: float | None):
+        """Ask the main Overpass server, and the mirror if it is busy or down.
+
+        The mirror is only tried if there is time left for it.
+        """
+        last_error: AgentAppError | None = None
+        for index, server in enumerate(OVERPASS_SERVERS):
+            timeout = OVERPASS_TIMEOUT
+            if index > 0:
+                left = (deadline - time.monotonic() - 1.5) if deadline else OVERPASS_TIMEOUT
+                if left < 2:
+                    break
+                timeout = min(OVERPASS_TIMEOUT, left)
+            url = server + "?" + urlencode({"data": query})
+            try:
+                return self._get_json(url, "the Overpass API", timeout)
+            except (ServiceUnavailableError, RateLimitedError) as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
 
     # ── Step 2b: events from Ticketmaster ────────────────────────────────────
 
@@ -371,13 +423,18 @@ class App:
 
     # ── Step 3: lore from Wikipedia ──────────────────────────────────────────
 
-    def _add_lore(self, legends: list[Spot]) -> None:
+    def _add_lore(self, legends: list[Spot], deadline: float | None = None) -> None:
+        timeout = LORE_TIMEOUT
+        if deadline is not None:
+            # Lore may use a little of the safety margin, but never all of it.
+            timeout = min(LORE_TIMEOUT, deadline + 1.5 - time.monotonic())
+
         def lookup(spot: Spot) -> None:
             title = _wiki_title(spot.wikipedia)
-            if title:
+            if title and timeout >= 0.8:
                 url = WIKIPEDIA_SUMMARY + quote(title.replace(" ", "_"), safe="")
                 try:
-                    data = self._get_json(url, "Wikipedia", LORE_TIMEOUT)
+                    data = self._get_json(url, "Wikipedia", timeout)
                     sentence = _first_sentence((data or {}).get("extract", ""))
                     if sentence:
                         spot.lore = sentence
@@ -425,6 +482,8 @@ def _spot_from_osm(element: dict, lat0: float, lon0: float) -> Spot | None:
     lon = element.get("lon") or (element.get("center") or {}).get("lon")
     if lat is None or lon is None:
         return None
+    if tags.get("memorial") in NOT_QUESTS or tags.get("historic") in NOT_QUESTS:
+        return None
     famous = bool(tags.get("wikipedia") or tags.get("wikidata"))
     amenity, tourism, historic = tags.get("amenity"), tags.get("tourism"), tags.get("historic")
 
@@ -447,7 +506,8 @@ def _spot_from_osm(element: dict, lat0: float, lon0: float) -> Spot | None:
         lat=float(lat), lon=float(lon),
         wikipedia=tags.get("wikipedia", ""),
         extra={k: tags[k] for k in ("historic", "start_date", "description",
-                                    "inscription", "heritage") if k in tags},
+                                    "inscription", "heritage", "opening_hours")
+               if k in tags},
     )
 
 
@@ -465,7 +525,7 @@ def _spot_from_event(item: dict, lat0: float, lon0: float, now: datetime) -> Spo
         distance = _distance_m(lat0, lon0, lat, lon)
     except (KeyError, TypeError, ValueError):
         lat = lon = None
-        distance = 0
+        distance = None
 
     start = _parse_utc((dates.get("start") or {}).get("dateTime"))
     end = _parse_utc((dates.get("end") or {}).get("dateTime"))
@@ -480,7 +540,7 @@ def _spot_from_event(item: dict, lat0: float, lon0: float, now: datetime) -> Spo
         when = f"on {local_date}" if local_date else "date to be confirmed"
 
     return Spot(name=name, kind="event", rarity=LIMITED, distance_m=distance,
-                lat=lat, lon=lon, when=when, start=start,
+                lat=lat, lon=lon, when=when, start=start, end=end,
                 extra={"venue": venue.get("name", "")})
 
 
@@ -498,7 +558,7 @@ def _spot_from_skiddle(item: dict, lat0: float, lon0: float, now: datetime) -> S
         distance = _distance_m(lat0, lon0, lat, lon)
     except (KeyError, TypeError, ValueError):
         lat = lon = None
-        distance = 0
+        distance = None
 
     start = _parse_utc(item.get("startdate"))
     end = _parse_utc(item.get("enddate"))
@@ -514,7 +574,7 @@ def _spot_from_skiddle(item: dict, lat0: float, lon0: float, now: datetime) -> S
         when = "date to be confirmed"
 
     return Spot(name=name, kind="event", rarity=LIMITED, distance_m=distance,
-                lat=lat, lon=lon, when=when, start=start,
+                lat=lat, lon=lon, when=when, start=start, end=end,
                 extra={"venue": venue.get("name", "")})
 
 
@@ -526,7 +586,8 @@ def _merge_events(events: list[Spot]) -> list[Spot]:
     an hour of each other (or either has no start time).
     """
     far = datetime.max.replace(tzinfo=timezone.utc)
-    ordered = sorted(events, key=lambda e: (e.start or far, e.distance_m))
+    ordered = sorted(events, key=lambda e: (
+        e.start or far, e.distance_m if e.distance_m is not None else 10**9))
     kept: list[Spot] = []
     for event in ordered:
         key = _name_key(event.name)
@@ -581,7 +642,7 @@ def _pick_board(spots: list[Spot], events: list[Spot]) -> list[Spot]:
             if tiers[tier] and len(board) < MAX_QUESTS:
                 board.append(tiers[tier].pop(0))
     rank = {LEGENDARY: 0, LIMITED: 1, RARE: 2, COMMON: 3}
-    board.sort(key=lambda s: (rank[s.rarity], s.distance_m))
+    board.sort(key=lambda s: (rank[s.rarity], s.distance_m if s.distance_m is not None else 10**9))
     return board
 
 
@@ -609,12 +670,12 @@ def _chain_lines(chain: list[Spot]) -> tuple[list[str], int]:
     lines, walked = [], 0
     for i, spot in enumerate(chain):
         if i == 0:
-            hop = f"{spot.distance_m} m from you"
+            hop = f"{_distance_text(spot)} from you"
         else:
             prev = chain[i - 1]
             step = _distance_m(prev.lat, prev.lon, spot.lat, spot.lon)
             walked += step
-            hop = f"then {step} m on"
+            hop = f"then ~{step} m on"
         line = f"{i + 1}. {BADGE[spot.rarity]}: {spot.name} ({hop}). {_flavour(spot)}"
         if spot.lore:
             line += f" Lore: {spot.lore}"
@@ -623,7 +684,7 @@ def _chain_lines(chain: list[Spot]) -> tuple[list[str], int]:
 
 
 def _quest_line(spot: Spot) -> str:
-    line = (f"{BADGE[spot.rarity]} | {spot.name} | {spot.distance_m} m | "
+    line = (f"{BADGE[spot.rarity]} | {spot.name} | {_distance_text(spot)} | "
             f"{spot.xp} XP | {_flavour(spot)}")
     if spot.rarity == LEGENDARY and spot.lore:
         line += f" Lore: {spot.lore}"
@@ -672,3 +733,104 @@ def _lore_from_tags(spot: Spot) -> str:
     if tags.get("heritage"):
         return "It is a protected heritage site."
     return ""  # no fact to hand: better no lore than made-up lore
+
+
+def _distance_text(spot: Spot) -> str:
+    """Straight-line distance, marked as approximate: walking is further."""
+    if spot.distance_m is None:
+        return "nearby"
+    return f"~{spot.distance_m} m"
+
+
+def _events_in_window_first(events: list[Spot], now: datetime, minutes: int) -> list[Spot]:
+    """With a time limit, events on now or starting within it come first."""
+    until = now + timedelta(minutes=minutes)
+
+    def in_window(event: Spot) -> bool:
+        if event.start is None:
+            return False
+        if event.start <= now:
+            return event.end is None or event.end >= now
+        return event.start <= until
+
+    return sorted(events, key=lambda e: 0 if in_window(e) else 1)  # stable
+
+
+# ── Opening hours ─────────────────────────────────────────────────────────────
+
+_DAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+_DAY_LIST = re.compile(r"^([A-Z][a-z](?:-[A-Z][a-z])?(?:,[A-Z][a-z](?:-[A-Z][a-z])?)*)\s+(.+)$")
+_RANGE = re.compile(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})\+?$")
+
+
+def _open_now(spec: str | None, now: datetime) -> bool | None:
+    """Is a place open at `now` (UK time), going by its OSM opening_hours?
+
+    True or False when the tag is in the common simple form
+    ("Mo-Fr 09:00-17:30; Sa 10:00-16:00; Su off", "24/7", "10:00-22:00",
+    overnight ranges such as "Fr,Sa 18:00-02:00"). None when there is no tag
+    or it uses anything fancier (months, holidays, sunset, comments): then
+    the place is kept, because unknown is not the same as closed.
+    """
+    if not spec or not spec.strip():
+        return None
+    spec = spec.strip()
+    if spec == "24/7":
+        return True
+
+    week: dict[int, list[tuple[int, int]]] = {d: [] for d in range(7)}
+    try:
+        for rule in spec.split(";"):
+            rule = rule.strip()
+            if not rule:
+                continue
+            if rule.startswith(("PH", "SH")):
+                continue  # public and school holidays: ignore those rules
+            match = _DAY_LIST.match(rule)
+            if match:
+                days, times = _parse_days(match.group(1)), match.group(2).strip()
+            else:
+                days, times = list(range(7)), rule
+            if times in ("off", "closed"):
+                ranges: list[tuple[int, int]] = []
+            elif times == "24/7":
+                ranges = [(0, 1440)]
+            else:
+                ranges = [_parse_range(part.strip()) for part in times.split(",")]
+            for day in days:  # a later rule replaces an earlier one for its days
+                week[day] = ranges
+    except (ValueError, KeyError):
+        return None
+
+    today, minute = now.weekday(), now.hour * 60 + now.minute
+    for start, end in week[today]:
+        if start < end and start <= minute < end:
+            return True
+        if end <= start and minute >= start:  # runs past midnight
+            return True
+    for start, end in week[(today - 1) % 7]:
+        if end <= start and minute < end:  # yesterday's late opening
+            return True
+    return False
+
+
+def _parse_days(text: str) -> list[int]:
+    days: list[int] = []
+    for piece in text.split(","):
+        if "-" in piece:
+            first, last = (_DAYS.index(p) for p in piece.split("-"))
+            span = (last - first) % 7
+            days += [(first + i) % 7 for i in range(span + 1)]
+        else:
+            days.append(_DAYS.index(piece))
+    return days
+
+
+def _parse_range(text: str) -> tuple[int, int]:
+    match = _RANGE.match(text)
+    if not match:
+        raise ValueError(text)
+    h1, m1, h2, m2 = (int(g) for g in match.groups())
+    if h1 > 24 or h2 > 24 or m1 > 59 or m2 > 59:
+        raise ValueError(text)
+    return h1 * 60 + m1, h2 * 60 + m2

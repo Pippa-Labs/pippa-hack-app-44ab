@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pippa_agentapp_sdk import (
@@ -19,7 +19,16 @@ from pippa_agentapp_sdk import (
     ServiceUnavailableError,
 )
 
-from app import App, NoPlaceGiven, NothingNearby, PlaceNotFound, _first_sentence
+from app import (
+    App,
+    NoPlaceGiven,
+    NothingNearby,
+    PlaceNotFound,
+    Spot,
+    _events_in_window_first,
+    _first_sentence,
+    _open_now,
+)
 
 # 14:00 on Friday 20 November 2026 (GMT, so UK time is the same as UTC).
 NOW = datetime(2026, 11, 20, 14, 0, tzinfo=timezone.utc)
@@ -48,6 +57,18 @@ OVERPASS_ELEMENTS = [
     node(7, 51.5105, -0.0745, amenity="cafe", name="Ravens Rest"),
     node(8, 51.5108, -0.0765, historic="wall", name="Roman Wall Fragment"),
     node(9, 51.5101, -0.0761, amenity="cafe", name=""),  # no name: ignored
+    # A named bench: tagged historic, but not a quest.
+    node(10, 51.5101, -0.0759, historic="memorial", memorial="bench",
+         name="In Memory of Ada"),
+    # A blue plaque: stays.
+    node(11, 51.5109, -0.0771, historic="memorial", memorial="plaque",
+         name="Pepys Plaque"),
+    # Closed at 14:00 on a Friday.
+    node(12, 51.5102, -0.0762, amenity="cafe", name="Breakfast Only",
+         opening_hours="Mo-Fr 07:00-11:00; Sa,Su 08:00-12:00"),
+    # Open now.
+    node(13, 51.5115, -0.0765, amenity="cafe", name="All Day Brew",
+         opening_hours="Mo-Su 08:00-18:00"),
 ]
 
 TICKETMASTER = {
@@ -326,7 +347,7 @@ def test_little_time_keeps_quests_close_and_short(key):
     assert places
     assert not any(q.startswith("🌟") for q in places)
     for line in places:
-        metres = int(line.split(" | ")[2].split()[0])
+        metres = int(line.split(" | ")[2].lstrip("~").split()[0])
         assert metres <= 600
 
 
@@ -390,3 +411,112 @@ def test_the_runner_enforces_the_manifest(monkeypatch):
     monkeypatch.setattr(App, "handle", lambda self, c: Result(data={"surprise": 1}))
     with pytest.raises(OutputShapeViolation):
         call({"place": "Tower Hill"})
+
+
+
+# ── 0.2.1: the review fixes ──────────────────────────────────────────────────
+
+
+def everything_returned(no_key_result):
+    data = no_key_result.data
+    return "\n".join(data["quests"] + data.get("quest_chain", []))
+
+
+def test_cafes_are_searched_closer_in_than_sights(no_key):
+    log = []
+    call({"place": "Tower Hill"}, make_fetch(log=log))
+    query = next(u for u in log if "overpass" in u)
+    assert "around%3A450%2C" in query      # cafés and restaurants
+    assert "around%3A1000%2C" in query     # landmarks, museums, hidden spots
+
+
+def test_memorial_benches_are_not_quests_but_plaques_are(no_key):
+    text = everything_returned(call({"place": "Tower Hill"}))
+    assert "In Memory of Ada" not in text
+    app = App()
+    app._fetch = make_fetch()
+    names = [s.name for s in app._places(51.51, -0.076, 1000)]
+    assert "Pepys Plaque" in names and "In Memory of Ada" not in names
+
+
+def test_places_closed_right_now_are_left_out(no_key):
+    text = everything_returned(call({"place": "Tower Hill"}))
+    assert "Breakfast Only" not in text
+
+
+@pytest.mark.parametrize("spec, when, expected", [
+    ("Mo-Fr 09:00-17:30", datetime(2026, 11, 20, 14, 0), True),    # Friday
+    ("Mo-Fr 09:00-17:30", datetime(2026, 11, 21, 14, 0), False),   # Saturday
+    ("Mo-Fr 09:00-17:30; Sa 10:00-16:00", datetime(2026, 11, 21, 14, 0), True),
+    ("Mo-Su 08:00-12:00,13:00-18:00", datetime(2026, 11, 20, 12, 30), False),
+    ("Fr,Sa 18:00-02:00", datetime(2026, 11, 21, 1, 0), True),     # Fri night
+    ("Fr,Sa 18:00-02:00", datetime(2026, 11, 20, 14, 0), False),
+    ("Mo-Su 10:00-22:00; We off", datetime(2026, 11, 18, 14, 0), False),
+    ("10:00-18:00", datetime(2026, 11, 22, 11, 0), True),
+    ("24/7", datetime(2026, 11, 22, 3, 0), True),
+    ("Mo-Fr 09:00-17:00; PH off", datetime(2026, 11, 20, 10, 0), True),
+    ("sunrise-sunset", datetime(2026, 11, 20, 10, 0), None),       # too fancy
+    ("Jan-Mar Mo-Fr 10:00-16:00", datetime(2026, 11, 20, 10, 0), None),
+    ("", datetime(2026, 11, 20, 10, 0), None),
+    (None, datetime(2026, 11, 20, 10, 0), None),
+])
+def test_opening_hours(spec, when, expected):
+    assert _open_now(spec, when) is expected
+
+
+def test_a_busy_main_overpass_server_falls_back_to_the_mirror(no_key):
+    log = []
+
+    def fetch(url, timeout=6.0):
+        log.append(url)
+        if "overpass-api.de" in url:
+            raise urllib.error.HTTPError(url, 504, "Gateway Timeout", {}, None)
+        if "overpass.private.coffee" in url:
+            return json.dumps({"elements": OVERPASS_ELEMENTS}).encode()
+        return make_fetch()(url, timeout)
+
+    result = call({"place": "Tower Hill"}, fetch)
+    assert result.data["quest_count"] >= 4
+    assert any("overpass.private.coffee" in u for u in log)
+
+
+def test_both_overpass_servers_down_is_reported(no_key):
+    def fetch(url, timeout=6.0):
+        if "overpass" in url:
+            raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+        return make_fetch()(url, timeout)
+
+    with pytest.raises(RateLimitedError):
+        call({"place": "Tower Hill"}, fetch)
+
+
+def test_an_event_without_a_venue_location_says_nearby(key):
+    no_location = {"_embedded": {"events": [
+        {"name": "Mystery Pop-Up",
+         "dates": {"start": {"dateTime": "2026-11-20T18:00:00Z"}},
+         "_embedded": {"venues": [{"name": "Secret Venue"}]}},
+    ]}}
+    quests = call({"place": "Tower Hill"}, make_fetch(events=no_location)).data["quests"]
+    event = next(q for q in quests if "Mystery Pop-Up" in q)
+    assert " | nearby | " in event and " 0 m" not in event
+
+
+def test_with_a_time_limit_events_happening_now_come_first():
+    def event(name, start_h, end_h=None):
+        start = NOW + timedelta(hours=start_h)
+        end = NOW + timedelta(hours=end_h) if end_h is not None else None
+        return Spot(name=name, kind="event", rarity="Limited", distance_m=100,
+                    start=start, end=end)
+
+    thursday = event("Thursday Gig", 72)
+    tonight = event("Tonight Show", 1.5)
+    on_now = event("Market On Now", -1, 2)
+    ordered = _events_in_window_first([thursday, tonight, on_now], NOW, 120)
+    assert [e.name for e in ordered[:2]] == ["Tonight Show", "Market On Now"]
+    assert ordered[-1].name == "Thursday Gig"
+
+
+def test_distances_are_marked_as_approximate(no_key):
+    data = call({"place": "Tower Hill"}).data
+    assert all(" | ~" in q for q in data["quests"])
+    assert all("~" in step for step in data["quest_chain"])

@@ -47,7 +47,7 @@ app:
   id: hack.app_44ab
   name: London Side Quests
   # Three numbers. Bump it before pushing again once a version is submitted.
-  version: 0.2.0
+  version: 0.2.1
   # Never use the word "by" here: the badge is split on the first "by".
   summary: >-
     Turns a London location into a quest board of nearby cafés, hidden spots,
@@ -63,12 +63,13 @@ outcomes:
   - id: quests.board
     summary: A quest board of things to explore near a London location, with XP, rarity and a quest chain
     example_phrases:
+      - things to do near
       - give me side quests near
+      - what's worth seeing near
+      - i have an hour to kill near
       - side quests around
       - quest board for
       - things to explore near
-      - what's interesting to do around
-      - i have an hour to kill near
       - fun places nearby in london
       - adventure ideas around
     inputs:
